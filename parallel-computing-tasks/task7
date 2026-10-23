@@ -1,0 +1,80 @@
+import os, time
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+
+STUDENT_ID = 230107088
+N = 30_000_000
+REPEATS = 5
+BLOCK = 65_536            # sub-block size for Kernel B so temporaries stay in cache (no extra RAM traffic)
+EFF_THRESHOLD = 0.60      # efficiency below this at max cores = "stalled"
+
+max_cores = os.cpu_count() or 1
+counts = sorted({1, 2, max_cores})
+
+A = np.random.default_rng(STUDENT_ID).random(N, dtype=np.float64)
+B = np.empty_like(A)
+
+def kernel_copy(lo, hi):                       # Kernel A: B[i] = A[i]   (memory-bound)
+    np.copyto(B[lo:hi], A[lo:hi])
+
+def kernel_trig(lo, hi):                       # Kernel B: sin*cos+tan (compute-bound)
+    t1 = np.empty(min(BLOCK, hi - lo)); t2 = np.empty_like(t1)
+    for s in range(lo, hi, BLOCK):
+        e = min(s + BLOCK, hi); m = e - s
+        a = A[s:e]; x, y = t1[:m], t2[:m]
+        np.sin(a, out=x); np.cos(a, out=y); np.multiply(x, y, out=x)
+        np.tan(a, out=y); np.add(x, y, out=B[s:e])
+
+def run(kernel, p, pool):
+    step = (N + p - 1) // p
+    futs = [pool.submit(kernel, lo, min(lo + step, N)) for lo in range(0, N, step)]
+    for f in futs: f.result()
+
+def bench(kernel, p):
+    with ThreadPoolExecutor(max_workers=p) as pool:
+        run(kernel, p, pool)                   # warm-up (also touches B's pages)
+        best = float("inf")
+        for _ in range(REPEATS):
+            t0 = time.perf_counter()
+            run(kernel, p, pool)
+            best = min(best, time.perf_counter() - t0)
+    return best * 1000
+
+# correctness check of Kernel B against a plain NumPy evaluation on a slice
+chk = A[:100_000]
+kernel_trig(0, 100_000)
+assert np.allclose(B[:100_000], np.sin(chk) * np.cos(chk) + np.tan(chk))
+
+print(f"Elements: {N:,} float64 ({A.nbytes / 1e6:.0f} MB per array) | logical cores: {max_cores} | best of {REPEATS}")
+summary = {}
+for name, kern in [("Kernel A: vector copy (memory-bound)", kernel_copy),
+                   ("Kernel B: sin*cos+tan (compute-bound)", kernel_trig)]:
+    print(f"\n{name}")
+    print(f"{'Cores':>6} | {'Wall Time (ms)':>14} | {'Speedup':>8} | {'Efficiency':>10}")
+    print("-" * 48)
+    t1 = None
+    for p in counts:
+        ms = bench(kern, p)
+        t1 = t1 or ms
+        sp = t1 / ms
+        eff = sp / p
+        print(f"{p:>6} | {ms:>14.1f} | {sp:>8.2f} | {eff:>10.2f}")
+    summary[name] = eff                         # efficiency at the largest core count
+
+effA = summary["Kernel A: vector copy (memory-bound)"]
+effB = summary["Kernel B: sin*cos+tan (compute-bound)"]
+print("\n=== CONCLUSION ===")
+if max_cores == 1:
+    print("Only 1 core detected: scaling cannot be assessed.")
+elif effA < EFF_THRESHOLD and effA < effB:
+    print(f"Kernel A (vector copy) STALLED in scaling due to memory channel saturation "
+          f"(efficiency {effA:.2f} at {max_cores} cores).")
+    print(f"Kernel B (sin*cos+tan) kept scaling because it is compute-bound (efficiency {effB:.2f}).")
+elif effB < EFF_THRESHOLD and effB < effA:
+    print(f"Unexpected: Kernel B stalled (efficiency {effB:.2f}) while Kernel A reached {effA:.2f}. "
+          "Check background load / thermal throttling / SMT (logical cores share execution units).")
+else:
+    print(f"Neither kernel clearly stalled (A: {effA:.2f}, B: {effB:.2f}). "
+          "Kernel A is expected to be the lower one if memory bandwidth is the limit.")
+print("Arithmetic intensity: Kernel A ~0 FLOP/byte (1 read + 1 write per element); "
+      "Kernel B does several transcendental functions per 16 bytes moved.")

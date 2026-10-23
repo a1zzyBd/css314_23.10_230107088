@@ -1,0 +1,61 @@
+import os, time
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+
+STUDENT_ID = 230107088
+A, B = 2.5, 1.0
+SIZES = [100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000]
+cores = os.cpu_count() or 1
+pool = ThreadPoolExecutor(max_workers=cores)
+
+def kernel(x, y, lo, hi):
+    np.multiply(x[lo:hi], A, out=y[lo:hi])   # y = a*x
+    np.add(y[lo:hi], B, out=y[lo:hi])        # y = a*x + b   (GIL released in both)
+
+def serial(x, y):
+    kernel(x, y, 0, len(x))
+
+def parallel(x, y):
+    n = len(x)
+    step = (n + cores - 1) // cores
+    futs = [pool.submit(kernel, x, y, lo, min(lo + step, n)) for lo in range(0, n, step)]
+    for f in futs:
+        f.result()
+
+def bench(fn, x, y, reps):
+    fn(x, y)  # warm-up
+    best = float("inf")
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        fn(x, y)
+        best = min(best, time.perf_counter() - t0)
+    return best
+
+rng = np.random.default_rng(STUDENT_ID)
+rows = []
+print(f"Cores used: {cores} | y[i] = {A}*x[i] + {B}")
+print(f"{'N':>12} | {'Serial (us)':>12} | {'Parallel (us)':>13} | {'Speedup':>8} | Winner")
+print("-" * 66)
+for n in SIZES:
+    x = rng.random(n); y = np.empty(n)
+    reps = max(5, min(3000, 3_000_000 // n))
+    ts, tp = bench(serial, x, y, reps), bench(parallel, x, y, reps)
+    rows.append((n, ts, tp))
+    print(f"{n:>12,} | {ts*1e6:>12.1f} | {tp*1e6:>13.1f} | {ts/tp:>8.2f} | {'parallel' if tp < ts else 'serial'}")
+
+# Locate the tipping point: last size where parallel is slower, first larger size where it's faster.
+slower = [n for n, ts, tp in rows if tp >= ts]
+faster = [n for n, ts, tp in rows if tp < ts]
+print()
+if not faster:
+    print("Parallel was never faster than serial for the tested sizes.")
+elif not slower:
+    print(f"Parallel was already faster at the smallest size tested (N = {SIZES[0]:,}).")
+else:
+    last_slower = max(slower)
+    first_faster = min(n for n in faster if n > last_slower) if any(n > last_slower for n in faster) else None
+    if first_faster:
+        print(f"CROSSOVER: parallel is SLOWER up to N = {last_slower:,} and FASTER from N = {first_faster:,}.")
+        print(f"Tipping point lies in the range {last_slower:,} < N <= {first_faster:,}.")
+    else:
+        print(f"Parallel stays slower or inconsistent; last slower size N = {last_slower:,}.")

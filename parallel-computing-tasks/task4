@@ -1,0 +1,48 @@
+import queue, threading, time
+
+W = 4
+N = 1000
+
+def work(i):
+    time.sleep(0.0001 * (i % 20))
+
+def run(strategy, chunk=1):
+    finish = [0.0] * W
+    start = time.perf_counter()
+
+    if strategy == "static":
+        block = N // W
+        def worker(w):
+            for i in range(w * block, (w + 1) * block):
+                work(i)
+            finish[w] = time.perf_counter()
+    else:
+        q = queue.Queue()
+        for lo in range(0, N, chunk):
+            q.put(range(lo, min(lo + chunk, N)))
+        def worker(w):
+            while True:
+                try:
+                    r = q.get_nowait()
+                except queue.Empty:
+                    break
+                for i in r:
+                    work(i)
+            finish[w] = time.perf_counter()
+
+    ts = [threading.Thread(target=worker, args=(w,)) for w in range(W)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    total = (time.perf_counter() - start) * 1000
+    times = [(f - start) * 1000 for f in finish]
+    return total, min(times), max(times)
+
+ideal = sum(0.0001 * (i % 20) for i in range(N)) * 1000 / W
+print(f"{N} items, {W} workers | ideal balanced time ~ {ideal:.1f} ms (+ sleep overhead)")
+print(f"{'Strategy':<22} | {'Total (ms)':>10} | {'First done':>10} | {'Last done':>10} | {'Delta (ms)':>10}")
+print("-" * 74)
+for name, strat, c in [("A: Static blocks", "static", 0),
+                       ("B: Dynamic chunk=1", "dynamic", 1),
+                       ("B: Dynamic chunk=5", "dynamic", 5)]:
+    total, mn, mx = run(strat, c)
+    print(f"{name:<22} | {total:>10.1f} | {mn:>10.1f} | {mx:>10.1f} | {mx - mn:>10.1f}")

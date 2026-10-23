@@ -1,0 +1,44 @@
+import os, time
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+
+STUDENT_ID = 230107088
+N = 20_000_000
+P = 0.95                      # parallel fraction for Amdahl's law
+REPEATS = 5
+
+data = np.random.default_rng(STUDENT_ID).random(N, dtype=np.float64)
+max_cores = os.cpu_count() or 1
+counts = sorted({1, 2, 4, max_cores, max_cores * 2})
+
+def partial_sum(lo, hi):
+    return float(np.sum(data[lo:hi]))   # NumPy releases the GIL here -> real parallelism
+
+def parallel_sum(pool, p):
+    step = (N + p - 1) // p
+    futs = [pool.submit(partial_sum, i, min(i + step, N)) for i in range(0, N, step)]
+    return sum(f.result() for f in futs)
+
+def amdahl(p, par=P):
+    return 1.0 / ((1 - par) + par / p)
+
+reference = float(np.sum(data))
+results = []
+for p in counts:
+    with ThreadPoolExecutor(max_workers=p) as pool:
+        parallel_sum(pool, p)                       # warm-up
+        best = float("inf")
+        for _ in range(REPEATS):
+            t0 = time.perf_counter()
+            s = parallel_sum(pool, p)
+            best = min(best, time.perf_counter() - t0)
+    assert abs(s - reference) / reference < 1e-9, "sum mismatch"
+    results.append((p, best * 1000))
+
+t1 = results[0][1]
+print(f"Logical cores: {max_cores} | N = {N:,} | best of {REPEATS} runs | P = {P}")
+print(f"{'Cores':>6} | {'Wall Time (ms)':>14} | {'Speedup':>8} | {'Amdahl Upper Bound':>18}")
+print("-" * 57)
+for p, ms in results:
+    print(f"{p:>6} | {ms:>14.2f} | {t1 / ms:>8.2f} | {amdahl(p):>18.2f}")
+print(f"\nAmdahl limit as p -> infinity: {1 / (1 - P):.1f}x")

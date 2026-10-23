@@ -1,0 +1,35 @@
+import os, platform, time
+import numpy as np
+
+STUDENT_ID = 230107088
+N = 20_000_000
+
+def cpu_model():
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or platform.machine()
+
+print(f"Student ID      : {STUDENT_ID}")
+print(f"OS              : {platform.system()} {platform.release()} ({platform.version()[:60]})")
+print(f"CPU             : {cpu_model()}")
+print(f"Logical cores   : {os.cpu_count()}")
+
+rng = np.random.default_rng(STUDENT_ID)
+data = rng.random(N, dtype=np.float64)          # 20,000,000 float64 elements
+print(f"Array           : {data.size:,} x {data.dtype}")
+
+# Serial (single-thread) sum and standard deviation.
+# NumPy's sum/std are single-threaded C loops (no BLAS involved).
+t0 = time.perf_counter()
+total = float(np.sum(data))
+std = float(np.std(data))
+t1 = time.perf_counter()
+
+print(f"Sum             : {total:.6f}")
+print(f"Std deviation   : {std:.10f}")
+print(f"Wall time (serial sum + std): {(t1 - t0) * 1000:.2f} ms")

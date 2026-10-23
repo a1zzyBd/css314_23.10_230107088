@@ -1,0 +1,69 @@
+"""
+Task 6 (Python): race condition vs. lock.
+CPython's GIL (3.10+) makes a bare `counter += 1` almost race-free, so the increment is written as an
+explicit read -> compute -> write (the compute step is a function call, where the interpreter may switch
+threads).  That is exactly what a non-atomic read-modify-write looks like to the hardware.
+"""
+import sys, threading, time
+
+THREADS, PER_THREAD = 4, 2_000_000
+EXPECTED = THREADS * PER_THREAD
+sys.setswitchinterval(1e-6)        # switch threads far more often than the 5 ms default
+
+counter = 0
+lock = threading.Lock()
+
+def add_one(x):
+    return x + 1
+
+def unsafe_worker():
+    global counter
+    for _ in range(PER_THREAD):
+        tmp = counter              # read
+        tmp = add_one(tmp)         # modify (thread switch can happen here)
+        counter = tmp              # write  -> may overwrite another thread's update
+
+def plain_worker():
+    global counter
+    for _ in range(PER_THREAD):
+        counter += 1               # bare increment (rarely races on CPython 3.10+)
+
+def safe_worker():
+    global counter
+    for _ in range(PER_THREAD):
+        with lock:                 # mutual exclusion: whole read-modify-write is one critical section
+            tmp = counter
+            tmp = add_one(tmp)
+            counter = tmp
+
+def run(target):
+    global counter
+    counter = 0
+    ts = [threading.Thread(target=target) for _ in range(THREADS)]
+    t0 = time.perf_counter()
+    for t in ts: t.start()
+    for t in ts: t.join()
+    return (time.perf_counter() - t0) * 1000, counter
+
+print(f"Python {sys.version.split()[0]} | threads: {THREADS} | increments per thread: {PER_THREAD:,}\n")
+
+t_unsafe, v_unsafe = run(unsafe_worker)
+lost = EXPECTED - v_unsafe
+print("--- Unsynchronized (read / modify / write) ---")
+print(f"Expected final value : {EXPECTED:,}")
+print(f"Actual final value   : {v_unsafe:,}")
+print(f"Updates lost         : {lost:,} ({100 * lost / EXPECTED:.2f}%)")
+print(f"Wall time            : {t_unsafe:.1f} ms\n")
+
+t_safe, v_safe = run(safe_worker)
+print("--- threading.Lock (mutex) ---")
+print(f"Final value          : {v_safe:,} ({'correct' if v_safe == EXPECTED else 'WRONG'})")
+print(f"Wall time            : {t_safe:.1f} ms\n")
+
+print("--- Synchronization penalty ---")
+print(f"Lock vs unsynchronized: {t_safe - t_unsafe:+.1f} ms ({t_safe / t_unsafe:.2f}x)\n")
+
+t_plain, v_plain = run(plain_worker)
+print("--- Extra: bare `counter += 1` (no lock) ---")
+print(f"Actual final value   : {v_plain:,} | lost: {EXPECTED - v_plain:,} ({100 * (EXPECTED - v_plain) / EXPECTED:.2f}%) | {t_plain:.1f} ms")
+print("(On CPython 3.10+ this often loses nothing because of the GIL; it is still not guaranteed safe.)")

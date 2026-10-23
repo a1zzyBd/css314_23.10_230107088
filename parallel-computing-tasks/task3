@@ -1,0 +1,48 @@
+import os, sys, time
+import multiprocessing as mp
+from multiprocessing import RawArray
+ 
+ITER = 50_000_000
+PAD = 16   # 16 x 8 bytes = 128 bytes between counters (>= 64-byte cache line)
+ 
+def worker(shared, idx, mode, ready, start):
+    ready.release()
+    start.wait()
+    if mode == "local":
+        local = 0
+        for _ in range(ITER):
+            local += 1
+        shared[idx] = local          # single write at the very end
+    else:
+        for _ in range(ITER):
+            shared[idx] += 1         # tight loop hammering the shared array
+ 
+def run(n, mode):
+    stride = PAD if mode == "padded" else 1
+    offset = PAD if mode == "padded" else 0   # keep counters off the array's first cache line
+    shared = RawArray("q", PAD * (n + 2))      # same allocation size for every mode
+    ready, start = mp.Semaphore(0), mp.Event()
+    ps = [mp.Process(target=worker, args=(shared, offset + i * stride, mode, ready, start)) for i in range(n)]
+    for p in ps: p.start()
+    for _ in ps: ready.acquire()               # wait until all workers are initialised
+    t0 = time.perf_counter()
+    start.set()
+    for p in ps: p.join()
+    ms = (time.perf_counter() - t0) * 1000
+    assert all(shared[offset + i * stride] == ITER for i in range(n))
+    return ms
+ 
+if __name__ == "__main__":
+    logical = os.cpu_count() or 1
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else max(1, logical // 2)
+    print(f"Logical cores: {logical} | processes (physical cores assumed): {n}")
+    print(f"Increments per process: {ITER:,}\n")
+    t_un = run(n, "unpadded")
+    t_pad = run(n, "padded")
+    t_loc = run(n, "local")
+    print(f"Unpadded Shared      : {t_un:>10.1f} ms")
+    print(f"Padded (128B stride) : {t_pad:>10.1f} ms")
+    print(f"Local var + 1 write  : {t_loc:>10.1f} ms")
+    print(f"\nExecution ratio Unpadded / Padded : {t_un / t_pad:.2f}x")
+    print(f"Execution ratio Unpadded / Local  : {t_un / t_loc:.2f}x")
+    print("Note: CPython's per-iteration overhead hides part of the cache effect; a ratio near 1.0x is plausible.")

@@ -1,0 +1,160 @@
+"""
+Task 8: compute geometry.
+  * NVIDIA GPU found (numba.cuda)  -> dot-product kernel, block sizes 32..1024, latency per geometry.
+  * No GPU                         -> 1024x1024 matmul: non-tiled vs 16x16 vs 64x64 tiles on all CPU cores.
+                                      (numba if installed = true loop-level cache behaviour; else NumPy/BLAS tiles)
+Install (optional): pip install numba      (GPU path also needs the CUDA toolkit / driver)
+"""
+import os, time
+import numpy as np
+
+STUDENT_ID = 230107088
+rng = np.random.default_rng(STUDENT_ID)
+
+try:
+    from numba import cuda
+    HAS_GPU = cuda.is_available()
+except Exception:
+    HAS_GPU = False
+try:
+    import numba
+    HAS_NUMBA = True
+except Exception:
+    HAS_NUMBA = False
+
+# ---------------------------------------------------------------- GPU path
+def gpu_dot():
+    from numba import float64
+    N = 1 << 24
+    a_h, b_h = rng.random(N), rng.random(N)
+    ref = float(np.dot(a_h, b_h))
+    a, b = cuda.to_device(a_h), cuda.to_device(b_h)
+    print(f"GPU: {cuda.get_current_device().name.decode() if isinstance(cuda.get_current_device().name, bytes) else cuda.get_current_device().name}")
+    print(f"Dot product of {N:,} float64 elements | reference (CPU) = {ref:.6f}\n")
+    print(f"{'Block size':>10} | {'Grid':>6} | {'Latency (ms)':>12} | {'Result OK':>9}")
+    print("-" * 50)
+
+    def make_kernel(BS):
+        @cuda.jit
+        def dot_kernel(x, y, partial):
+            sh = cuda.shared.array(BS, dtype=float64)
+            tid = cuda.threadIdx.x
+            i = cuda.grid(1)
+            stride = cuda.gridDim.x * cuda.blockDim.x
+            s = 0.0
+            while i < x.size:
+                s += x[i] * y[i]
+                i += stride
+            sh[tid] = s
+            cuda.syncthreads()
+            off = BS // 2
+            while off > 0:
+                if tid < off:
+                    sh[tid] += sh[tid + off]
+                cuda.syncthreads()
+                off //= 2
+            if tid == 0:
+                partial[cuda.blockIdx.x] = sh[0]
+        return dot_kernel
+
+    for BS in [32, 64, 128, 256, 512, 1024]:
+        grid = min((N + BS - 1) // BS, 4096)
+        partial = cuda.device_array(grid, dtype=np.float64)
+        k = make_kernel(BS)
+        k[grid, BS](a, b, partial); cuda.synchronize()          # warm-up / JIT compile
+        times = []
+        for _ in range(10):
+            s, e = cuda.event(), cuda.event()
+            s.record(); k[grid, BS](a, b, partial); e.record(); e.synchronize()
+            times.append(cuda.event_elapsed_time(s, e))
+        ok = abs(float(partial.copy_to_host().sum()) - ref) / ref < 1e-9
+        print(f"{BS:>10} | {grid:>6} | {min(times):>12.4f} | {str(ok):>9}")
+
+# ---------------------------------------------------------------- CPU path
+N = 1024
+cores = os.cpu_count() or 1
+
+def cpu_numba():
+    from numba import njit, prange, set_num_threads
+    set_num_threads(cores)
+
+    @njit(parallel=True, fastmath=True)
+    def naive(A, B, C):
+        n = A.shape[0]
+        for i in prange(n):
+            for j in range(n):
+                s = 0.0
+                for k in range(n):
+                    s += A[i, k] * B[k, j]        # B walked column-wise -> cache-unfriendly
+                C[i, j] = s
+
+    @njit(parallel=True, fastmath=True)
+    def tiled(A, B, C, bs):
+        n = A.shape[0]
+        nb = (n + bs - 1) // bs
+        for ib in prange(nb):
+            i0 = ib * bs; i1 = min(i0 + bs, n)
+            for jb in range(nb):
+                j0 = jb * bs; j1 = min(j0 + bs, n)
+                for i in range(i0, i1):
+                    for j in range(j0, j1):
+                        C[i, j] = 0.0
+                for kb in range(nb):
+                    k0 = kb * bs; k1 = min(k0 + bs, n)
+                    for i in range(i0, i1):
+                        for k in range(k0, k1):
+                            a = A[i, k]
+                            for j in range(j0, j1):
+                                C[i, j] += a * B[k, j]     # tile of B reused from cache
+    return {"non-tiled": lambda A, B, C: naive(A, B, C),
+            "tiled 16x16": lambda A, B, C: tiled(A, B, C, 16),
+            "tiled 64x64": lambda A, B, C: tiled(A, B, C, 64)}
+
+def cpu_numpy():
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=cores)
+
+    def band_nontiled(A, B, C, lo, hi):
+        np.matmul(A[lo:hi], B, out=C[lo:hi])            # one big call per thread (library decides blocking)
+
+    def band_tiled(A, B, C, lo, hi, bs):
+        C[lo:hi] = 0.0
+        for jj in range(0, N, bs):
+            for kk in range(0, N, bs):
+                C[lo:hi, jj:jj + bs] += A[lo:hi, kk:kk + bs] @ B[kk:kk + bs, jj:jj + bs]
+
+    def run(fn, A, B, C, *extra):
+        step = max(1, (N + cores - 1) // cores)
+        if extra:                                        # keep row bands tile-aligned
+            step = ((step + extra[0] - 1) // extra[0]) * extra[0]
+        futs = [pool.submit(fn, A, B, C, lo, min(lo + step, N), *extra) for lo in range(0, N, step)]
+        for f in futs: f.result()
+
+    return {"non-tiled": lambda A, B, C: run(band_nontiled, A, B, C),
+            "tiled 16x16": lambda A, B, C: run(band_tiled, A, B, C, 16),
+            "tiled 64x64": lambda A, B, C: run(band_tiled, A, B, C, 64)}
+
+def cpu_matmul():
+    A, B = rng.random((N, N)), rng.random((N, N))
+    ref = A @ B
+    impl = cpu_numba() if HAS_NUMBA else cpu_numpy()
+    backend = "numba loops (true cache behaviour)" if HAS_NUMBA else "NumPy/BLAS tile calls (BLAS blocks internally; call overhead matters)"
+    print(f"No CUDA GPU detected -> CPU matmul {N}x{N} float64 | threads: {cores} | backend: {backend}\n")
+    print(f"{'Variant':<12} | {'Runtime (ms)':>12} | {'GFLOP/s':>8} | {'ns / inner iter':>15} | {'vs non-tiled':>12} | OK")
+    print("-" * 82)
+    base = None
+    for name, fn in impl.items():
+        C = np.zeros((N, N))
+        fn(A, B, C)                                     # warm-up / JIT
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter(); fn(A, B, C); best = min(best, time.perf_counter() - t0)
+        base = base or best
+        ok = np.allclose(C, ref)
+        print(f"{name:<12} | {best * 1000:>12.1f} | {2 * N**3 / best / 1e9:>8.2f} | "
+              f"{best * 1e9 / N**3 * cores:>15.3f} | {base / best:>11.2f}x | {ok}")
+    print("\nCache-miss effect is inferred from runtime differences (and the per-iteration cost column);")
+    print("Python cannot read hardware counters. For real miss counts on Linux: perf stat -e cache-misses,cache-references python task8.py")
+
+if __name__ == "__main__":
+    gpu_dot() if HAS_GPU else cpu_matmul()
