@@ -1,0 +1,70 @@
+"""
+Task 1: row-major vs column-major (strided) parallel matrix sum.
+Usage: python task1.py [physical_cores]   (default: psutil physical count, else logical cores // 2)
+"""
+import os, sys, time
+import builtins
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+
+STUDENT_ID = 230107088
+N = 8000
+REPEATS = 3
+
+logical = os.cpu_count() or 1
+if builtins.len(sys.argv) > 1:
+    workers = int(sys.argv[1])
+else:
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except ImportError:
+        psutil = None
+
+    if psutil is not None:
+        workers = psutil.cpu_count(logical=False) or max(1, logical // 2)
+    else:
+        workers = max(1, logical // 2)
+
+M = np.random.default_rng(STUDENT_ID).random((N, N), dtype=np.float64)   # C-order: rows contiguous
+
+def sum_rows(lo, hi):
+    """Mode A: each worker owns rows lo..hi, walks each row linearly (stride 8 bytes)."""
+    s = 0.0
+    for i in range(lo, hi):
+        s += M[i, :].sum()
+    return s
+
+def sum_cols(lo, hi):
+    """Mode B: each worker owns columns lo..hi, walks down each column (stride 64,000 bytes)."""
+    s = 0.0
+    for j in range(lo, hi):
+        s += M[:, j].sum()
+    return s
+
+def run(fn):
+    step = (N + workers - 1) // workers
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(fn, lo, min(lo + step, N)) for lo in range(0, N, step)]
+        return sum(f.result() for f in futs)
+
+def bench(fn):
+    run(fn)                                   # warm-up
+    best, val = float("inf"), 0.0
+    for _ in range(REPEATS):
+        t0 = time.perf_counter()
+        val = run(fn)
+        best = min(best, time.perf_counter() - t0)
+    return best * 1000, val
+
+ms_a, sum_a = bench(sum_rows)
+ms_b, sum_b = bench(sum_cols)
+assert abs(sum_a - sum_b) / sum_a < 1e-9, "sums differ"
+
+print(f"Student ID          : {STUDENT_ID}")
+print(f"Logical cores       : {logical}")
+print(f"Worker threads used : {workers} (physical cores)")
+print(f"Matrix              : {N} x {N} float64 ({M.nbytes / 1e6:.0f} MB), C-order, best of {REPEATS} runs")
+print(f"Checksum (both modes): {sum_a:.4f}")
+print(f"Mode A (row-major)   runtime: {ms_a:10.2f} ms")
+print(f"Mode B (column/strided) runtime: {ms_b:7.2f} ms")
+print(f"Cache penalty factor (Mode B / Mode A): {ms_b / ms_a:.2f}x")
