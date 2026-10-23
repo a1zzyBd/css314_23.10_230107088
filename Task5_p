@@ -1,0 +1,53 @@
+
+import hashlib, os, time
+from concurrent.futures import ThreadPoolExecutor
+
+STUDENT_ID = 230107088
+TASKS = 10_000
+ITERATIONS = 500
+TOLERANCE = 0.03          # a size must be >3% slower than the best so far to count as "worsening"
+
+cores = os.cpu_count() or 1
+sizes = sorted({max(1, s) for s in [1, cores // 2, cores, cores * 2, cores * 4, cores * 16, 256]})
+
+payload = (str(STUDENT_ID) * 200)[:1024].encode()         # 1 KB string
+
+def task(i):
+    return hashlib.pbkdf2_hmac("sha256", payload, i.to_bytes(4, "little"), ITERATIONS)
+
+def run(pool_size):
+    with ThreadPoolExecutor(max_workers=pool_size) as pool:
+        list(pool.map(task, range(min(pool_size, 8))))     # start the worker threads before timing
+        t0 = time.perf_counter()
+        res = list(pool.map(task, range(TASKS), chunksize=1))
+        ms = (time.perf_counter() - t0) * 1000
+    return ms, res
+
+print(f"Student ID: {STUDENT_ID} | logical cores: {cores} | tasks: {TASKS:,} x PBKDF2-SHA256 (1 KB input, {ITERATIONS} iterations)")
+reference = None
+rows = []
+for s in sizes:
+    best, res = min((run(s) for _ in range(3)), key=lambda r: r[0])      # best of 3
+    reference = reference or res
+    assert res == reference, "results differ between pool sizes"
+    rows.append((s, best))
+
+t1 = rows[0][1]
+best_so_far, worsen_at = float("inf"), None
+print(f"\n{'Pool Size':>9} | {'Execution Time (ms)':>19} | {'Speedup vs 1 thread':>19} | Status")
+print("-" * 80)
+for s, ms in rows:
+    if worsen_at is None and ms > best_so_far * (1 + TOLERANCE):
+        worsen_at, status = s, "WORSENING: oversubscription overhead starts here"
+    elif ms < best_so_far:
+        status, best_so_far = ("baseline" if s == rows[0][0] else "improving / new best"), ms
+    else:
+        status = "plateau (within tolerance)" if worsen_at is None else "degraded"
+    print(f"{s:>9} | {ms:>19.1f} | {t1 / ms:>18.2f}x | {status}")
+
+peak = min(rows, key=lambda r: r[1])
+print(f"\nFastest pool size: {peak[0]} ({peak[1]:.1f} ms)")
+if worsen_at:
+    print(f"Execution time first worsens (>{TOLERANCE:.0%} slower than best so far) at pool size = {worsen_at}.")
+else:
+    print(f"No pool size was >{TOLERANCE:.0%} slower than the best so far; oversubscription cost is below measurement noise here.")

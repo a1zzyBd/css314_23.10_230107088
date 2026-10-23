@@ -1,0 +1,14 @@
+Task5_p
+Student ID: 230107088 | logical cores: 16 | tasks: 10,000 x PBKDF2-SHA256 (1 KB input, 500 iterations)
+
+Pool Size | Execution Time (ms) | Speedup vs 1 thread | Status
+--------------------------------------------------------------------------------
+        1 |              8279.6 |               1.00x | baseline
+        8 |              1287.9 |               6.43x | improving / new best
+       16 |               987.4 |               8.39x | improving / new best
+       32 |               940.2 |               8.81x | improving / new best
+       64 |               959.7 |               8.63x | plateau (within tolerance)
+      256 |              1147.5 |               7.22x | WORSENING: oversubscription overhead starts here
+
+Fastest pool size: 32 (940.2 ms)
+Execution time first worsens (>3% slower than best so far) at pool size = 256.
