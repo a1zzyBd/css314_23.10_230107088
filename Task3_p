@@ -1,0 +1,56 @@
+
+import os, sys, time
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+
+STUDENT_ID = 230107088
+N = 2_000_000
+REPEATS = 7
+WORKERS = os.cpu_count() or 1
+
+data = np.random.default_rng(STUDENT_ID).integers(1, 11, size=N, dtype=np.int64)   # values 1..10
+
+def serial_scan(a):
+    out = np.empty_like(a)
+    np.cumsum(a, out=out)                    # output[i] = output[i-1] + input[i], single thread
+    return out
+
+bounds = [(lo, min(lo + (N + WORKERS - 1) // WORKERS, N)) for lo in range(0, N, (N + WORKERS - 1) // WORKERS)]
+pool = ThreadPoolExecutor(max_workers=WORKERS)
+
+def pass1(a, out, lo, hi):                   # local inclusive scan of one chunk
+    np.cumsum(a[lo:hi], out=out[lo:hi])
+    return out[hi - 1]                       # chunk total
+
+def pass2(out, lo, hi, offset):              # add the sum of all previous chunks
+    out[lo:hi] += offset
+
+def parallel_scan(a):
+    out = np.empty_like(a)
+    totals = [f.result() for f in [pool.submit(pass1, a, out, lo, hi) for lo, hi in bounds]]
+    offsets = np.concatenate(([0], np.cumsum(totals)[:-1]))          # offset reduction over chunk sums
+    for f in [pool.submit(pass2, out, lo, hi, int(off)) for (lo, hi), off in zip(bounds, offsets) if off]:
+        f.result()
+    return out
+
+def bench(fn):
+    fn(data)                                 # warm-up
+    best, res = float("inf"), None
+    for _ in range(REPEATS):
+        t0 = time.perf_counter()
+        res = fn(data)
+        best = min(best, time.perf_counter() - t0)
+    return best * 1000, res
+
+ms_s, out_s = bench(serial_scan)
+ms_p, out_p = bench(parallel_scan)
+
+ok = out_p[-1] == out_s[-1] and np.array_equal(out_p, out_s)
+print(f"Student ID: {STUDENT_ID} | N = {N:,} ints (1..10) | workers: {WORKERS} | best of {REPEATS}")
+print(f"Last element: serial = {out_s[-1]:,} | parallel = {out_p[-1]:,}")
+print(f"{'Serial Time (ms)':>17} | {'Parallel Time (ms)':>18} | {'Speedup':>8} | Verification Status")
+print(f"{ms_s:>17.3f} | {ms_p:>18.3f} | {ms_s / ms_p:>7.2f}x | {'PASS' if ok else 'FAIL'}")
+print("Work: serial = N additions; parallel scan = ~2N additions (extra pass), i.e. less work-efficient but fewer sequential steps.")
+if not ok:
+    print("ERROR: parallel scan does not match serial scan", file=sys.stderr)
+    sys.exit(1)

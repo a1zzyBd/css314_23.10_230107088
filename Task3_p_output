@@ -1,0 +1,6 @@
+Task3_p
+Student ID: 230107088 | N = 2,000,000 ints (1..10) | workers: 16 | best of 7
+Last element: serial = 11,007,629 | parallel = 11,007,629
+ Serial Time (ms) | Parallel Time (ms) |  Speedup | Verification Status
+            7.734 |              6.729 |    1.15x | PASS
+Work: serial = N additions; parallel scan = ~2N additions (extra pass), i.e. less work-efficient but fewer sequential steps.
