@@ -1,0 +1,102 @@
+
+import time
+import numpy as np
+import multiprocessing as mp
+from multiprocessing import shared_memory
+
+STUDENT_ID = 230107088
+
+try:
+    from numba import cuda
+    HAS_GPU = cuda.is_available()
+except Exception:
+    HAS_GPU = False
+
+# ------------------------------------------------------------------ GPU path
+def gpu_profile():
+    @cuda.jit
+    def vmul(x, y, out):
+        i = cuda.grid(1)
+        if i < x.size:
+            out[i] = x[i] * y[i]
+
+    rng = np.random.default_rng(STUDENT_ID)
+    print(f"GPU: {cuda.get_current_device().name}")
+    print(f"{'N':>12} | {'H2D (ms)':>9} | {'Kernel (ms)':>11} | {'D2H (ms)':>9} | {'Total (ms)':>10} | {'PCIe % of total':>15}")
+    print("-" * 82)
+    for N in [100_000, 1_000_000, 20_000_000]:
+        x, y = rng.random(N, dtype=np.float32), rng.random(N, dtype=np.float32)
+        out_h = np.empty(N, dtype=np.float32)
+        tpb = 256; blocks = (N + tpb - 1) // tpb
+        dx, dy, dout = cuda.to_device(x), cuda.to_device(y), cuda.device_array(N, dtype=np.float32)
+        vmul[blocks, tpb](dx, dy, dout); cuda.synchronize()          # JIT warm-up
+        best = None
+        for _ in range(5):
+            t0 = time.perf_counter(); dx = cuda.to_device(x); dy = cuda.to_device(y); cuda.synchronize()
+            t1 = time.perf_counter(); vmul[blocks, tpb](dx, dy, dout); cuda.synchronize()
+            t2 = time.perf_counter(); dout.copy_to_host(out_h); cuda.synchronize()
+            t3 = time.perf_counter()
+            r = ((t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3)
+            if best is None or sum(r) < sum(best): best = r
+        h2d, ker, d2h = best; tot = sum(best)
+        print(f"{N:>12,} | {h2d:>9.3f} | {ker:>11.3f} | {d2h:>9.3f} | {tot:>10.3f} | {100 * (h2d + d2h) / tot:>14.1f}%")
+    print("\nPCIe % = (H2D + D2H) / (H2D + Kernel + D2H). Both input arrays are copied H2D; one result array D2H.")
+
+# ------------------------------------------------------------------ CPU path
+def child(cmd_q, ack_q):
+    while True:
+        msg = cmd_q.get()
+        if msg is None:
+            break
+        if msg[0] == "pickle":
+            arr = msg[1]                                   # already deserialised by get()
+            ack_q.put(float(arr[0] + arr[-1]))
+        else:                                              # ("shm", name, n)
+            shm = shared_memory.SharedMemory(name=msg[1])
+            try:   # the creator owns/unlinks the block; stop the child's tracker from also claiming it
+                from multiprocessing import resource_tracker
+                resource_tracker.unregister(shm._name, "shared_memory")
+            except Exception:
+                pass
+            arr = np.ndarray((msg[2],), dtype=np.float64, buffer=shm.buf)   # zero-copy view
+            v = float(arr[0] + arr[-1])
+            del arr
+            shm.close()
+            ack_q.put(v)
+
+def cpu_ipc():
+    rng = np.random.default_rng(STUDENT_ID)
+    cmd_q, ack_q = mp.Queue(), mp.Queue()
+    p = mp.Process(target=child, args=(cmd_q, ack_q)); p.start()
+    cmd_q.put(("pickle", np.zeros(4))); ack_q.get()        # warm the child up
+
+    print(f"CPU only (no CUDA GPU) | float64 arrays | best of 5 round trips (send -> child has data -> ack)")
+    print(f"{'N':>12} | {'MB':>6} | {'A: Queue/pickle (ms)':>20} | {'B1: shm create+copy (ms)':>24} | {'B2: shm zero-copy (ms)':>22} | {'A / B1':>7} | {'A / B2':>8}")
+    print("-" * 124)
+    for N in [100_000, 1_000_000, 10_000_000]:
+        data = rng.random(N, dtype=np.float64)
+        ta, tb1, tb2 = [], [], []
+        # keep one pre-filled shared block for the zero-copy case (data already lives in shared memory)
+        pre = shared_memory.SharedMemory(create=True, size=data.nbytes)
+        np.ndarray((N,), dtype=np.float64, buffer=pre.buf)[:] = data
+        for _ in range(5):
+            t0 = time.perf_counter(); cmd_q.put(("pickle", data)); ack_q.get(); ta.append(time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            shm = shared_memory.SharedMemory(create=True, size=data.nbytes)
+            np.ndarray((N,), dtype=np.float64, buffer=shm.buf)[:] = data
+            cmd_q.put(("shm", shm.name, N)); ack_q.get()
+            tb1.append(time.perf_counter() - t0)
+            shm.close(); shm.unlink()
+
+            t0 = time.perf_counter(); cmd_q.put(("shm", pre.name, N)); ack_q.get(); tb2.append(time.perf_counter() - t0)
+        pre.close(); pre.unlink()
+        a, b1, b2 = min(ta) * 1e3, min(tb1) * 1e3, min(tb2) * 1e3
+        print(f"{N:>12,} | {data.nbytes / 1e6:>6.1f} | {a:>20.3f} | {b1:>24.3f} | {b2:>22.3f} | {a / b1:>6.1f}x | {a / b2:>7.1f}x")
+    cmd_q.put(None); p.join()
+    print("\nPath A serialises (pickle) and copies the array through a pipe, so cost grows with size.")
+    print("Path B1 pays one memcpy into shared memory; B2 (producer already writes into shared memory) is truly zero-copy,")
+    print("so its cost stays roughly constant regardless of N.")
+
+if __name__ == "__main__":
+    gpu_profile() if HAS_GPU else cpu_ipc()
